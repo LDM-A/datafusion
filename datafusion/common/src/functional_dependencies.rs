@@ -522,16 +522,18 @@ pub fn get_target_functional_dependencies(
     for FunctionalDependence {
         source_indices,
         target_indices,
-        ..
+        nullable,
+        mode,
     } in &dependencies.deps
     {
+        if *nullable && *mode == Dependency::Single {
+            continue;
+        }
         let source_key_names = source_indices
             .iter()
-            .map(|id_key_idx| &field_names[*id_key_idx])
+            .map(|idx| &field_names[*idx])
             .collect::<Vec<_>>();
-        // If the GROUP BY expression contains a determinant key, we can use
-        // the associated fields after aggregation even if they are not part
-        // of the GROUP BY expression.
+
         if source_key_names
             .iter()
             .all(|source_key_name| group_by_expr_names.contains(source_key_name))
