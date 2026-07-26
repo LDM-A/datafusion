@@ -196,7 +196,6 @@ impl FunctionalDependencies {
     pub fn new(dependencies: Vec<FunctionalDependence>) -> Self {
         Self { deps: dependencies }
     }
-
     /// Creates a new `FunctionalDependencies` object from the given constraints.
     pub fn new_from_constraints(
         constraints: Option<&Constraints>,
@@ -522,18 +521,16 @@ pub fn get_target_functional_dependencies(
     for FunctionalDependence {
         source_indices,
         target_indices,
-        nullable,
-        mode,
+        ..
     } in &dependencies.deps
     {
-        if *nullable && *mode == Dependency::Single {
-            continue;
-        }
         let source_key_names = source_indices
             .iter()
-            .map(|idx| &field_names[*idx])
+            .map(|id_key_idx| &field_names[*id_key_idx])
             .collect::<Vec<_>>();
-
+        // If the GROUP BY expression contains a determinant key, we can use
+        // the associated fields after aggregation even if they are not part
+        // of the GROUP BY expression.
         if source_key_names
             .iter()
             .all(|source_key_name| group_by_expr_names.contains(source_key_name))
