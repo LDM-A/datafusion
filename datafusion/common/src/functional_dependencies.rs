@@ -566,9 +566,17 @@ pub fn get_required_group_by_exprs_indices(
     for FunctionalDependence {
         source_indices,
         target_indices,
+        nullable,
         ..
     } in &dependencies.deps
     {
+        // Nullable functional dependencies cannot be used to remove GROUP BY
+        // expressions. For example, a nullable UNIQUE column does not determine
+        // other columns because multiple NULL values are allowed.
+        if *nullable {
+            continue;
+        }
+
         if source_indices
             .iter()
             .all(|source_idx| groupby_expr_indices.contains(source_idx))

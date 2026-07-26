@@ -244,7 +244,7 @@ logical_plan
 02)--TableScan: t_uniq projection=[x, y]
 
 
-statement ok
+statement okf
 CREATE TABLE t_null (x INT) AS VALUES (NULL), (NULL);
 
 statement ok
