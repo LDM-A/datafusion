@@ -118,6 +118,107 @@ DROP TABLE dict_ndv;
 statement ok
 RESET datafusion.execution.batch_size;
 
+######
+# A semi/anti join estimate only treats a measured distinct count as evidence of
+# which keys the inner side holds. Without one, the inner distinct count is a
+# bound derived from the value range, which says nothing about which of those
+# values occur, so the estimate falls back to an uncertain 50% overlap instead of
+# assuming (almost) full coverage (apache/datafusion#25617).
+######
+
+# 100 "customers" with keys 1..100, one row each.
+query I
+COPY (SELECT value AS c_custkey FROM generate_series(1, 100))
+TO 'test_files/scratch/parquet_ndv_write/customer.parquet'
+STORED AS PARQUET;
+----
+100
+
+statement ok
+CREATE EXTERNAL TABLE customer
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_ndv_write/customer.parquet';
+
+# 200 "orders" over 25 distinct keys (4, 8, ..., 100): more rows than values in
+# the range 4..100, so without a written NDV the distinct count is the range.
+statement ok
+set datafusion.execution.parquet.write_row_group_number_distinct_values = false;
+
+query I
+COPY (SELECT g.value * 4 AS o_custkey
+      FROM generate_series(1, 25) AS g
+      CROSS JOIN (VALUES (1), (2), (3), (4), (5), (6), (7), (8)) AS r)
+TO 'test_files/scratch/parquet_ndv_write/orders_no_ndv.parquet'
+STORED AS PARQUET;
+----
+200
+
+statement ok
+CREATE EXTERNAL TABLE orders_no_ndv
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_ndv_write/orders_no_ndv.parquet';
+
+statement ok
+set datafusion.execution.parquet.write_row_group_number_distinct_values = true;
+
+query I
+COPY (SELECT g.value * 4 AS o_custkey
+      FROM generate_series(1, 25) AS g
+      CROSS JOIN (VALUES (1), (2), (3), (4), (5), (6), (7), (8)) AS r)
+TO 'test_files/scratch/parquet_ndv_write/orders_ndv.parquet'
+STORED AS PARQUET;
+----
+200
+
+statement ok
+CREATE EXTERNAL TABLE orders_ndv
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_ndv_write/orders_ndv.parquet';
+
+# 75 of the 100 customers have no orders, whichever file is used.
+query I
+SELECT count(*) FROM customer
+WHERE NOT EXISTS (SELECT 1 FROM orders_no_ndv WHERE o_custkey = c_custkey);
+----
+75
+
+query I
+SELECT count(*) FROM customer
+WHERE NOT EXISTS (SELECT 1 FROM orders_ndv WHERE o_custkey = c_custkey);
+----
+75
+
+# Without an NDV the inner distinct count is the range bound (97), which must
+# not be read as "97 of the 100 keys occur": the anti join estimate is the 50%
+# fallback, 50 rows, rather than 3.
+query TT
+EXPLAIN SELECT c_custkey FROM customer
+WHERE NOT EXISTS (SELECT 1 FROM orders_no_ndv WHERE o_custkey = c_custkey);
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(c_custkey@0, o_custkey@0)], statistics=[Rows=Inexact(50), Bytes=Inexact(400), [(Col[0]: Min=Inexact(Int64(1)) Max=Inexact(Int64(100)) Null=Inexact(0) Distinct=Inexact(50) ScanBytes=Inexact(400))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_ndv_write/customer.parquet]]}, projection=[c_custkey], output_ordering=[c_custkey@0 ASC NULLS LAST], file_type=parquet, statistics=[Rows=Exact(100), Bytes=Exact(800), [(Col[0]: Min=Exact(Int64(1)) Max=Exact(Int64(100)) Null=Exact(0) Distinct=Inexact(100) ScanBytes=Exact(800))]]
+03)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_ndv_write/orders_no_ndv.parquet]]}, projection=[o_custkey], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible, statistics=[Rows=Inexact(200), Bytes=Inexact(1600), [(Col[0]: Min=Inexact(Int64(4)) Max=Inexact(Int64(100)) Null=Inexact(0) ScanBytes=Inexact(1600))]]
+
+# With the written NDV (25), the estimate uses it: 100 - 100 * 25 / 100 = 75.
+query TT
+EXPLAIN SELECT c_custkey FROM customer
+WHERE NOT EXISTS (SELECT 1 FROM orders_ndv WHERE o_custkey = c_custkey);
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(c_custkey@0, o_custkey@0)], statistics=[Rows=Inexact(75), Bytes=Inexact(600), [(Col[0]: Min=Inexact(Int64(1)) Max=Inexact(Int64(100)) Null=Inexact(0) Distinct=Inexact(75) ScanBytes=Inexact(600))]]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_ndv_write/customer.parquet]]}, projection=[c_custkey], output_ordering=[c_custkey@0 ASC NULLS LAST], file_type=parquet, statistics=[Rows=Exact(100), Bytes=Exact(800), [(Col[0]: Min=Exact(Int64(1)) Max=Exact(Int64(100)) Null=Exact(0) Distinct=Inexact(100) ScanBytes=Exact(800))]]
+03)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_ndv_write/orders_ndv.parquet]]}, projection=[o_custkey], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible, statistics=[Rows=Inexact(200), Bytes=Inexact(1600), [(Col[0]: Min=Inexact(Int64(4)) Max=Inexact(Int64(100)) Null=Inexact(0) Distinct=Inexact(25) ScanBytes=Inexact(1600))]]
+
+statement ok
+DROP TABLE customer;
+
+statement ok
+DROP TABLE orders_no_ndv;
+
+statement ok
+DROP TABLE orders_ndv;
+
 # Reset settings
 statement ok
 RESET datafusion.execution.parquet.write_row_group_number_distinct_values;

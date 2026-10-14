@@ -830,8 +830,8 @@ fn estimate_inner_join_cardinality(
         .iter()
         .zip(right_column_statistics.iter())
     {
-        let left_max_distinct = max_distinct_count(&left_num_rows, left_stat);
-        let right_max_distinct = max_distinct_count(&right_num_rows, right_stat);
+        let left_max_distinct = max_distinct_count(&left_num_rows, left_stat).count;
+        let right_max_distinct = max_distinct_count(&right_num_rows, right_stat).count;
         let max_distinct = left_max_distinct.max(&right_max_distinct);
         if max_distinct.get_value().is_some() {
             // Seems like there are a few implementations of this algorithm that implement
@@ -924,6 +924,13 @@ fn estimate_disjoint_inputs(
     None
 }
 
+/// Semi join selectivity for a key column whose inner-side distinct count is
+/// only known as an upper bound derived from its value range (see
+/// [`DistinctCountSource::ValueRange`]). PostgreSQL's `eqjoinsel_semi` uses
+/// the same `0.5` whenever a side's distinct count is a default rather than a
+/// measured statistic.
+const UNCERTAIN_OVERLAP_SELECTIVITY: f64 = 0.5;
+
 /// Estimates the number of outer rows that have at least one matching
 /// key on the inner side (i.e. semi join cardinality) using NDV
 /// (Number of Distinct Values) statistics.
@@ -956,11 +963,27 @@ fn estimate_disjoint_inputs(
 /// * `null_frac = 1.0` → selectivity = 0.0 (no non-null rows can match)
 /// * Missing NDV statistics → returns `None` (fallback to `outer_rows`)
 ///
+/// The distinct counts come from [`max_distinct_count`]. A measured count,
+/// or the row count of a side whose rows do not outnumber its possible
+/// values, is used as the estimate. A count that was derived from the inner
+/// side's value range is not: it is a ceiling on the distinct keys the inner
+/// side could hold, reached only when the column has more rows than possible
+/// values, so values repeat and nothing says how many of the possible values
+/// occur. Feeding it into `min(outer_ndv, inner_ndv) / outer_ndv` would
+/// assert that every value in the range occurs, hence that (almost) every
+/// outer key is covered, which turns an anti join estimate into (almost)
+/// nothing. For such a column the selectivity is
+/// [`UNCERTAIN_OVERLAP_SELECTIVITY`] instead, still reduced by the null
+/// fraction. Ranges keep ruling matches *out* through the disjointness check
+/// that runs before this function.
+///
 /// PostgreSQL uses a similar approach in `eqjoinsel_semi`
 /// (`src/backend/utils/adt/selfuncs.c`). When NDV statistics are
 /// available on both sides it computes selectivity as `nd2 / nd1`,
 /// which is equivalent to `min(outer_ndv, inner_ndv) / outer_ndv`.
-/// If either side lacks statistics it falls back to a default.
+/// If either side's distinct count is a default rather than a measured
+/// statistic, it uses a fixed selectivity of `0.5` instead, which is the
+/// fallback adopted here.
 fn estimate_semi_join_cardinality(
     outer_num_rows: &Precision<usize>,
     inner_num_rows: &Precision<usize>,
@@ -994,7 +1017,8 @@ fn estimate_semi_join_cardinality(
         let outer_ndv = max_distinct_count(outer_num_rows, outer_stat);
         let inner_ndv = max_distinct_count(inner_num_rows, inner_stat);
 
-        if let (Some(&o), Some(&i)) = (outer_ndv.get_value(), inner_ndv.get_value())
+        if let (Some(&o), Some(&i)) =
+            (outer_ndv.count.get_value(), inner_ndv.count.get_value())
             && o > 0
         {
             let null_frac = if null_equality == NullEquality::NullEqualsNothing {
@@ -1012,7 +1036,15 @@ fn estimate_semi_join_cardinality(
             } else {
                 0.0
             };
-            selectivity *= (o.min(i) as f64) / (o as f64) * (1.0 - null_frac);
+            // A range-derived inner count bounds the keys the inner side could
+            // hold and says nothing about which of them occur (see the doc
+            // comment), so it cannot stand in for `inner_ndv` here.
+            let coverage = if inner_ndv.source == DistinctCountSource::ValueRange {
+                UNCERTAIN_OVERLAP_SELECTIVITY
+            } else {
+                (o.min(i) as f64) / (o as f64)
+            };
+            selectivity *= coverage * (1.0 - null_frac);
             has_selectivity_estimate = true;
         }
     }
@@ -1024,19 +1056,49 @@ fn estimate_semi_join_cardinality(
     }
 }
 
+/// Where a distinct count produced by [`max_distinct_count`] came from.
+///
+/// Only [`Measured`](Self::Measured) describes the values that actually occur
+/// in the column. The other variants are upper bounds derived from other
+/// statistics: they say how many distinct values the column *could* hold, not
+/// how many it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistinctCountSource {
+    /// The column's `distinct_count` statistic.
+    Measured,
+    /// The non-null row count: every row could hold a different value.
+    RowCount,
+    /// The number of values between `min_value` and `max_value`, which is
+    /// smaller than the row count. Values therefore repeat, and the range says
+    /// nothing about how many of the possible values occur.
+    ValueRange,
+    /// No usable statistic.
+    Unknown,
+}
+
+/// A distinct count estimate together with how it was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DistinctCountEstimate {
+    count: Precision<usize>,
+    source: DistinctCountSource,
+}
+
 /// Estimate the number of maximum distinct values that can be present in the
 /// given column from its statistics. If distinct_count is available, uses it
 /// directly. Otherwise, if the column is numeric and has min/max values, it
 /// estimates the maximum distinct count from those. Otherwise, the num_rows
 /// is used.
+///
+/// The returned [`DistinctCountSource`] tells the caller which of these it
+/// got, since only a measured count is evidence of the values that occur.
 fn max_distinct_count(
     num_rows: &Precision<usize>,
     stats: &ColumnStatistics,
-) -> Precision<usize> {
+) -> DistinctCountEstimate {
     match &stats.distinct_count {
         &dc @ (Precision::Exact(_) | Precision::Inexact(_)) => {
             // NDV can never exceed the number of rows
-            match num_rows {
+            let count = match num_rows {
                 Precision::Absent => dc,
                 _ => {
                     if dc.get_value() <= num_rows.get_value() {
@@ -1045,12 +1107,16 @@ fn max_distinct_count(
                         num_rows.to_inexact()
                     }
                 }
+            };
+            DistinctCountEstimate {
+                count,
+                source: DistinctCountSource::Measured,
             }
         }
         _ => {
             // The number can never be greater than the number of rows we have
             // minus the nulls (since they don't count as distinct values).
-            let result = match num_rows {
+            let count = match num_rows {
                 Precision::Absent => Precision::Absent,
                 Precision::Inexact(count) => {
                     // To safeguard against inexact number of rows (e.g. 0) being smaller than
@@ -1070,6 +1136,14 @@ fn max_distinct_count(
                     }
                 }
             };
+            let result = DistinctCountEstimate {
+                count,
+                source: if count == Precision::Absent {
+                    DistinctCountSource::Unknown
+                } else {
+                    DistinctCountSource::RowCount
+                },
+            };
             // Cap the estimate using the number of possible values:
             if let (Some(min), Some(max)) =
                 (stats.min_value.get_value(), stats.max_value.get_value())
@@ -1079,15 +1153,19 @@ fn max_distinct_count(
             {
                 let range_dc = range_dc as usize;
                 // Note that the `unwrap` calls in the below statement are safe.
-                return if result == Precision::Absent
-                    || &range_dc < result.get_value().unwrap()
+                return if result.count == Precision::Absent
+                    || &range_dc < result.count.get_value().unwrap()
                 {
-                    if stats.min_value.is_exact().unwrap()
+                    let count = if stats.min_value.is_exact().unwrap()
                         && stats.max_value.is_exact().unwrap()
                     {
                         Precision::Exact(range_dc)
                     } else {
                         Precision::Inexact(range_dc)
+                    };
+                    DistinctCountEstimate {
+                        count,
+                        source: DistinctCountSource::ValueRange,
                     }
                 } else {
                     result
@@ -3796,11 +3874,15 @@ mod tests {
                 (10, Inexact(15), Inexact(25), Absent, Absent),
                 Some(46),
             ),
+            // RightSemi swaps the sides: the inner (left) side has 50 rows over
+            // 11 possible values, so its distinct count is a range bound rather
+            // than evidence of which values occur, and the column falls back to
+            // the uncertain-overlap selectivity: ceil(10 * 0.5) = 5.
             (
                 JoinType::RightSemi,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(10),
+                Some(5),
             ),
             (
                 JoinType::LeftSemi,
@@ -3832,11 +3914,13 @@ mod tests {
                 (10, Inexact(15), Inexact(25), Absent, Absent),
                 Some(4),
             ),
+            // RightAnti with the same range-bounded inner side: 10 - 5 = 5,
+            // where treating the range as full coverage gave 0.
             (
                 JoinType::RightAnti,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(0),
+                Some(5),
             ),
             (
                 JoinType::LeftAnti,
@@ -3964,6 +4048,78 @@ mod tests {
                 (200, Absent, Absent, Inexact(10), Absent),
                 Some(100),
             ),
+            // Range-bounded inner side (apache/datafusion#25617), shaped like
+            // TPC-H Q22: 150,000 customers NOT EXISTS 1,500,000 orders, keys
+            // 1..150000 and 1..149999, no distinct counts. The inner distinct
+            // count is the range (149,999) only because the column has more
+            // rows than possible values; that is not evidence that every key
+            // occurs, so coverage falls back to 0.5: semi 75,000, anti 75,000
+            // (previously semi 149,999 and anti 1).
+            (
+                JoinType::LeftAnti,
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                (1_500_000, Inexact(1), Inexact(149_999), Absent, Absent),
+                Some(75_000),
+            ),
+            (
+                JoinType::LeftSemi,
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                (1_500_000, Inexact(1), Inexact(149_999), Absent, Absent),
+                Some(75_000),
+            ),
+            // Same join with a measured inner distinct count (three quarters of
+            // the customers have orders): the measurement is used as is,
+            // semi = 150,000 * 112,500 / 150,000 = 112,500, anti = 37,500.
+            (
+                JoinType::LeftAnti,
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                (
+                    1_500_000,
+                    Inexact(1),
+                    Inexact(149_999),
+                    Inexact(112_500),
+                    Absent,
+                ),
+                Some(37_500),
+            ),
+            (
+                JoinType::LeftSemi,
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                (
+                    1_500_000,
+                    Inexact(1),
+                    Inexact(149_999),
+                    Inexact(112_500),
+                    Absent,
+                ),
+                Some(112_500),
+            ),
+            // The inner distinct count comes from the row count when the rows
+            // do not outnumber the possible values (6,000 customers left after
+            // a filter, keys 1..150000): that estimate is kept, and the outer
+            // orders' range-bounded count stays in the denominator:
+            // semi = ceil(1,500,000 * 6,000 / 149,999) = 60,001.
+            (
+                JoinType::LeftSemi,
+                (1_500_000, Inexact(1), Inexact(149_999), Absent, Absent),
+                (6_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                Some(60_001),
+            ),
+            // Orders EXISTS / NOT EXISTS customers: the inner (customer) count
+            // is row-count based, so every order is still covered: semi
+            // 1,500,000, anti 0.
+            (
+                JoinType::LeftSemi,
+                (1_500_000, Inexact(1), Inexact(149_999), Absent, Absent),
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                Some(1_500_000),
+            ),
+            (
+                JoinType::LeftAnti,
+                (1_500_000, Inexact(1), Inexact(149_999), Absent, Absent),
+                (150_000, Inexact(1), Inexact(150_000), Absent, Absent),
+                Some(0),
+            ),
         ];
 
         let join_on = vec![(
@@ -4010,6 +4166,133 @@ mod tests {
                 "failure for join_type: {join_type}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_max_distinct_count_reports_its_source() {
+        use DistinctCountSource::*;
+
+        let estimate = |num_rows, stats| max_distinct_count(&num_rows, &stats);
+        let expected = |count, source| DistinctCountEstimate { count, source };
+
+        // A measured distinct count is used as is...
+        assert_eq!(
+            estimate(
+                Inexact(100),
+                create_column_stats(Inexact(1), Inexact(1000), Inexact(10), Absent)
+            ),
+            expected(Inexact(10), Measured)
+        );
+        // ...and capping it at the row count keeps it a measurement.
+        assert_eq!(
+            estimate(
+                Inexact(100),
+                create_column_stats(Absent, Absent, Inexact(200), Absent)
+            ),
+            expected(Inexact(100), Measured)
+        );
+        // Without one, the non-null row count is the estimate...
+        assert_eq!(
+            estimate(
+                Exact(100),
+                create_column_stats(Absent, Absent, Absent, Exact(10))
+            ),
+            expected(Exact(90), RowCount)
+        );
+        // ...also when the value range leaves room for every row to differ.
+        assert_eq!(
+            estimate(
+                Exact(100),
+                create_column_stats(Exact(1), Exact(100), Absent, Absent)
+            ),
+            expected(Inexact(100), RowCount)
+        );
+        // A range narrower than the row count is reported as the bound it is.
+        assert_eq!(
+            estimate(
+                Exact(1000),
+                create_column_stats(Exact(1), Exact(10), Absent, Absent)
+            ),
+            expected(Exact(10), ValueRange)
+        );
+        assert_eq!(
+            estimate(
+                Inexact(1000),
+                create_column_stats(Inexact(1), Exact(10), Absent, Absent)
+            ),
+            expected(Inexact(10), ValueRange)
+        );
+        // So is a range with an unknown row count.
+        assert_eq!(
+            estimate(
+                Absent,
+                create_column_stats(Exact(1), Exact(10), Absent, Absent)
+            ),
+            expected(Exact(10), ValueRange)
+        );
+        // Nothing to go on.
+        assert_eq!(
+            estimate(Absent, create_column_stats(Absent, Absent, Absent, Absent)),
+            expected(Absent, Unknown)
+        );
+    }
+
+    #[test]
+    fn test_semi_join_range_bound_inner_column_falls_back_per_column() -> Result<()> {
+        let join_on = vec![
+            (
+                Arc::new(Column::new("l_col0", 0)) as _,
+                Arc::new(Column::new("r_col0", 0)) as _,
+            ),
+            (
+                Arc::new(Column::new("l_col1", 1)) as _,
+                Arc::new(Column::new("r_col1", 1)) as _,
+            ),
+        ];
+
+        // col0: measured on both sides, outer_ndv=20, inner_ndv=10 → 0.5
+        // col1: the inner side has 200 rows over 150 possible values and no
+        //       distinct count, so its count is a range bound → 0.5 fallback
+        //       (the formula would have given min(100, 150) / 100 = 1.0)
+        // semi = ceil(100 * 0.5 * 0.5) = 25, anti = 100 - 25 = 75
+        let outer = || Statistics {
+            num_rows: Inexact(100),
+            total_byte_size: Absent,
+            column_statistics: vec![
+                create_column_stats(Absent, Absent, Inexact(20), Absent),
+                create_column_stats(Inexact(1), Inexact(1000), Absent, Absent),
+            ],
+        };
+        let inner = || Statistics {
+            num_rows: Inexact(200),
+            total_byte_size: Absent,
+            column_statistics: vec![
+                create_column_stats(Absent, Absent, Inexact(10), Absent),
+                create_column_stats(Inexact(1), Inexact(150), Absent, Absent),
+            ],
+        };
+
+        let semi = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            outer(),
+            inner(),
+            &join_on,
+            NullEquality::NullEqualsNothing,
+        )
+        .map(|stats| stats.num_rows);
+        assert_eq!(semi, Some(25));
+
+        let anti = estimate_join_cardinality(
+            &JoinType::LeftAnti,
+            outer(),
+            inner(),
+            &join_on,
+            NullEquality::NullEqualsNothing,
+        )
+        .map(|stats| stats.num_rows);
+        assert_eq!(anti, Some(75));
 
         Ok(())
     }
@@ -4846,7 +5129,7 @@ mod tests {
             byte_size: Absent,
         };
         let result = max_distinct_count(&num_rows, &stats);
-        assert_eq!(result, Exact(0));
+        assert_eq!(result.count, Exact(0));
     }
 
     #[test]
@@ -5308,7 +5591,8 @@ mod tests {
                     distinct_count: Exact(5),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Exact(5)
         );
         assert_eq!(
@@ -5318,7 +5602,8 @@ mod tests {
                     distinct_count: Inexact(5),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Inexact(5)
         );
         // Inexact num_rows does not affect an exact NDV that is within bounds
@@ -5329,7 +5614,8 @@ mod tests {
                     distinct_count: Exact(5),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Exact(5)
         );
     }
@@ -5346,7 +5632,8 @@ mod tests {
                     distinct_count: Exact(15),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Inexact(10)
         );
         assert_eq!(
@@ -5356,7 +5643,8 @@ mod tests {
                     distinct_count: Exact(15),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Inexact(10)
         );
         assert_eq!(
@@ -5366,7 +5654,8 @@ mod tests {
                     distinct_count: Inexact(15),
                     ..Default::default()
                 }
-            ),
+            )
+            .count,
             Inexact(10)
         );
     }
